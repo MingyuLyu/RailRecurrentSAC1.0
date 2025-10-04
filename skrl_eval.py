@@ -1,0 +1,233 @@
+
+
+from skrl.agents.torch.sac import SAC_RNN as SAC
+from skrl.envs.wrappers.torch import wrap_env
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
+from skrl.agents.torch.sac import SAC_DEFAULT_CONFIG
+
+import gymnasium as gym
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# import the skrl components to build the RL system
+from skrl.agents.torch.sac import SAC_DEFAULT_CONFIG
+from skrl.agents.torch.sac import SAC_RNN as SAC
+from skrl.envs.wrappers.torch import wrap_env
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.trainers.torch import SequentialTrainer
+from skrl.utils import set_seed
+
+
+
+class Actor(GaussianMixin, Model):
+    def __init__(self, observation_space, action_space, device, clip_actions=False,
+                 clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum",
+                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=20):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
+
+        self.num_envs = num_envs
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size  # Hcell (Hout is Hcell because proj_size = 0)
+        self.sequence_length = sequence_length
+
+        self.lstm = nn.LSTM(input_size=self.num_observations,
+                            hidden_size=self.hidden_size,
+                            num_layers=self.num_layers,
+                            batch_first=True)  # batch_first -> (batch, sequence, features)
+
+        self.linear_layer_1 = nn.Linear(self.hidden_size, 400)
+        self.linear_layer_2 = nn.Linear(400, 300)
+        self.action_layer = nn.Linear(300, self.num_actions)
+
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+    def get_specification(self):
+        # batch size (N) is the number of envs
+        return {"rnn": {"sequence_length": self.sequence_length,
+                        "sizes": [(self.num_layers, self.num_envs, self.hidden_size),    # hidden states (D ∗ num_layers, N, Hout)
+                                  (self.num_layers, self.num_envs, self.hidden_size)]}}  # cell states   (D ∗ num_layers, N, Hcell)
+
+    def compute(self, inputs, role):
+        states = inputs["states"]
+        terminated = inputs.get("terminated", None)
+        hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
+
+        # training
+        if self.training:
+            rnn_input = states.view(-1, self.sequence_length, states.shape[-1])  # (N, L, Hin): N=batch_size, L=sequence_length
+            hidden_states = hidden_states.view(self.num_layers, -1, self.sequence_length, hidden_states.shape[-1])  # (D * num_layers, N, L, Hout)
+            cell_states = cell_states.view(self.num_layers, -1, self.sequence_length, cell_states.shape[-1])  # (D * num_layers, N, L, Hcell)
+            # get the hidden/cell states corresponding to the initial sequence
+            hidden_states = hidden_states[:,:,0,:].contiguous()  # (D * num_layers, N, Hout)
+            cell_states = cell_states[:,:,0,:].contiguous()  # (D * num_layers, N, Hcell)
+
+            # reset the RNN state in the middle of a sequence
+            if terminated is not None and torch.any(terminated):
+                rnn_outputs = []
+                terminated = terminated.view(-1, self.sequence_length)
+                indexes = [0] + (terminated[:,:-1].any(dim=0).nonzero(as_tuple=True)[0] + 1).tolist() + [self.sequence_length]
+
+                for i in range(len(indexes) - 1):
+                    i0, i1 = indexes[i], indexes[i + 1]
+                    rnn_output, (hidden_states, cell_states) = self.lstm(rnn_input[:,i0:i1,:], (hidden_states, cell_states))
+                    hidden_states[:, (terminated[:,i1-1]), :] = 0
+                    cell_states[:, (terminated[:,i1-1]), :] = 0
+                    rnn_outputs.append(rnn_output)
+
+                rnn_states = (hidden_states, cell_states)
+                rnn_output = torch.cat(rnn_outputs, dim=1)
+            # no need to reset the RNN state in the sequence
+            else:
+                rnn_output, rnn_states = self.lstm(rnn_input, (hidden_states, cell_states))
+        # rollout
+        else:
+            rnn_input = states.view(-1, 1, states.shape[-1])  # (N, L, Hin): N=num_envs, L=1
+            rnn_output, rnn_states = self.lstm(rnn_input, (hidden_states, cell_states))
+
+        # flatten the RNN output
+        rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)  # (N, L, D ∗ Hout) -> (N * L, D ∗ Hout)
+
+        x = F.relu(self.linear_layer_1(rnn_output))
+        x = F.relu(self.linear_layer_2(x))
+
+        # Pendulum-v1 action_space is -2 to 2
+        return 2 * torch.tanh(self.action_layer(x)), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
+
+class Critic(DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device, clip_actions=False,
+                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=20):
+        Model.__init__(self, observation_space, action_space, device)
+        DeterministicMixin.__init__(self, clip_actions)
+
+        self.num_envs = num_envs
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size  # Hcell (Hout is Hcell because proj_size = 0)
+        self.sequence_length = sequence_length
+
+        self.lstm = nn.LSTM(input_size=self.num_observations,
+                            hidden_size=self.hidden_size,
+                            num_layers=self.num_layers,
+                            batch_first=True)  # batch_first -> (batch, sequence, features)
+
+        self.linear_layer_1 = nn.Linear(self.hidden_size + self.num_actions, 400)
+        self.linear_layer_2 = nn.Linear(400, 300)
+        self.linear_layer_3 = nn.Linear(300, 1)
+
+    def get_specification(self):
+        # batch size (N) is the number of envs
+        return {"rnn": {"sequence_length": self.sequence_length,
+                        "sizes": [(self.num_layers, self.num_envs, self.hidden_size),    # hidden states (D ∗ num_layers, N, Hout)
+                                  (self.num_layers, self.num_envs, self.hidden_size)]}}  # cell states   (D ∗ num_layers, N, Hcell)
+
+    def compute(self, inputs, role):
+        states = inputs["states"]
+        terminated = inputs.get("terminated", None)
+        hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
+
+        # critic is only used during training
+        rnn_input = states.view(-1, self.sequence_length, states.shape[-1])  # (N, L, Hin): N=batch_size, L=sequence_length
+
+        hidden_states = hidden_states.view(self.num_layers, -1, self.sequence_length, hidden_states.shape[-1])  # (D * num_layers, N, L, Hout)
+        cell_states = cell_states.view(self.num_layers, -1, self.sequence_length, cell_states.shape[-1])  # (D * num_layers, N, L, Hcell)
+        # get the hidden/cell states corresponding to the initial sequence
+        sequence_index = 1 if role in ["target_critic_1", "target_critic_2"] else 0  # target networks act on the next state of the environment
+        hidden_states = hidden_states[:,:,sequence_index,:].contiguous()  # (D * num_layers, N, Hout)
+        cell_states = cell_states[:,:,sequence_index,:].contiguous()  # (D * num_layers, N, Hcell)
+
+        # reset the RNN state in the middle of a sequence
+        if terminated is not None and torch.any(terminated):
+            rnn_outputs = []
+            terminated = terminated.view(-1, self.sequence_length)
+            indexes = [0] + (terminated[:,:-1].any(dim=0).nonzero(as_tuple=True)[0] + 1).tolist() + [self.sequence_length]
+
+            for i in range(len(indexes) - 1):
+                i0, i1 = indexes[i], indexes[i + 1]
+                rnn_output, (hidden_states, cell_states) = self.lstm(rnn_input[:,i0:i1,:], (hidden_states, cell_states))
+                hidden_states[:, (terminated[:,i1-1]), :] = 0
+                cell_states[:, (terminated[:,i1-1]), :] = 0
+                rnn_outputs.append(rnn_output)
+
+            rnn_states = (hidden_states, cell_states)
+            rnn_output = torch.cat(rnn_outputs, dim=1)
+        # no need to reset the RNN state in the sequence
+        else:
+            rnn_output, rnn_states = self.lstm(rnn_input, (hidden_states, cell_states))
+
+        # flatten the RNN output
+        rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)  # (N, L, D ∗ Hout) -> (N * L, D ∗ Hout)
+
+        x = F.relu(self.linear_layer_1(torch.cat([rnn_output, inputs["taken_actions"]], dim=1)))
+        x = F.relu(self.linear_layer_2(x))
+
+        return self.linear_layer_3(x), {"rnn": [rnn_states[0], rnn_states[1]]}
+# --- 1️⃣ 构建环境 (必须和训练时一模一样)
+class NoVelocityWrapper(gym.ObservationWrapper):
+    def observation(self, observation):
+        obs = observation.copy().astype(np.float32)
+        obs[2] = 0.0  # mask velocity
+        return obs
+
+gym.register(id="PendulumNoVel-v1",
+             entry_point=lambda: NoVelocityWrapper(gym.make("Pendulum-v1")))
+
+env = wrap_env(gym.make("PendulumNoVel-v1"))
+device = env.device
+
+# --- 2️⃣ 重新定义 Actor / Critic (结构需与训练时完全相同)
+# （这里省略重复定义，你可以直接复制训练脚本里那两段 Actor/Critic 类）
+# class Actor(...) ...
+# class Critic(...) ...
+
+# --- 3️⃣ 创建模型和 agent（不需要 memory）
+models = {
+    "policy":          Actor(env.observation_space, env.action_space, device, clip_actions=True, num_envs=env.num_envs),
+    "critic_1":        Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+    "critic_2":        Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+    "target_critic_1": Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+    "target_critic_2": Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs)
+}
+
+cfg = SAC_DEFAULT_CONFIG.copy()
+agent = SAC(models=models,
+            memory=None,
+            cfg=cfg,
+            observation_space=env.observation_space,
+            action_space=env.action_space,
+            device=device)
+
+# --- 4️⃣ 加载 checkpoint
+agent.load("runs/torch/PendulumNoVel/checkpoints/best_agent.pt")
+print("✅ Agent checkpoint loaded successfully!")
+
+# 重新创建一个带渲染的环境
+env_render = gym.make("PendulumNoVel-v1", render_mode="human")
+env_render = wrap_env(env_render)
+
+agent.set_running_mode("eval")  # 评估模式（确定性动作）
+
+with torch.no_grad():
+    state, _ = env_render.reset()
+    done = False
+    total_reward = 0
+    t = 0
+    while not done:
+        # 得到动作
+        action = agent.act(torch.as_tensor(state, device=device).unsqueeze(0),
+                           timestep=t, timesteps=0)
+        # 环境推进
+        next_state, reward, terminated, truncated, _ = env_render.step(action.cpu().numpy())
+        done = bool(terminated[0] or truncated[0])
+        total_reward += float(reward[0])
+        state = next_state
+        t += 1
+        env_render.render()  # 打开渲染窗口
+    print("Episode reward:", total_reward)
+
+env_render.close()
+
