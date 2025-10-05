@@ -23,7 +23,7 @@ set_seed()  # e.g. `set_seed(42)` for fixed seed
 class Actor(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
                  clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum",
-                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=20):
+                 num_envs=1, num_layers=2, hidden_size=512, sequence_length=32):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
 
@@ -93,11 +93,19 @@ class Actor(GaussianMixin, Model):
         x = F.relu(self.linear_layer_2(x))
 
         # Pendulum-v1 action_space is -2 to 2
-        return 2 * torch.tanh(self.action_layer(x)), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
+        # return 2 * torch.tanh(self.action_layer(x)), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
+        # 通用动作缩放：tanh 输出 ∈ [-1, 1] → 线性映射到 [low, high]
+        raw = torch.tanh(self.action_layer(x))  # (N*L, num_actions)
+
+        act_low = torch.as_tensor(self.action_space.low, device=raw.device, dtype=raw.dtype)
+        act_high = torch.as_tensor(self.action_space.high, device=raw.device, dtype=raw.dtype)
+
+        mean = (act_high + act_low) / 2 + raw * (act_high - act_low) / 2
+        return mean, self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
 
 class Critic(DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
-                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=20):
+                 num_envs=1, num_layers=2, hidden_size=512, sequence_length=32):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions)
 
@@ -182,7 +190,7 @@ device = env.device
 
 
 # instantiate a memory as experience replay
-memory = RandomMemory(memory_size=20000, num_envs=env.num_envs, device=device, replacement=False)
+memory = RandomMemory(memory_size=1000000, num_envs=env.num_envs, device=device, replacement=False)
 
 
 # instantiate the agent's models (function approximators).
@@ -203,14 +211,14 @@ for model in models.values():
 # configure and instantiate the agent (visit its documentation to see all the options)
 # https://skrl.readthedocs.io/en/latest/api/agents/sac.html#configuration-and-hyperparameters
 cfg = SAC_DEFAULT_CONFIG.copy()
-cfg["discount_factor"] = 0.98
-cfg["batch_size"] = 100
-cfg["random_timesteps"] = 0
-cfg["learning_starts"] = 1000
+cfg["discount_factor"] = 0.99
+cfg["batch_size"] = 512
+cfg["random_timesteps"] = 65536
+cfg["learning_starts"] = 100000
 cfg["learn_entropy"] = True
 # logging to TensorBoard and write checkpoints (in timesteps)
-cfg["experiment"]["write_interval"] = 75
-cfg["experiment"]["checkpoint_interval"] = 750
+cfg["experiment"]["write_interval"] = 1000
+cfg["experiment"]["checkpoint_interval"] = 25000
 cfg["experiment"]["directory"] = "runs/torch/LSTMSAC_TrainSpeedControl2/"
 
 agent = SAC(models=models,
@@ -222,7 +230,7 @@ agent = SAC(models=models,
 
 
 # configure and instantiate the RL trainer
-cfg_trainer = {"timesteps": 15000, "headless": True}
+cfg_trainer = {"timesteps": 1000000, "headless": True}
 trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=[agent])
 
 # start training
