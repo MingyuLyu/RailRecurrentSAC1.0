@@ -1,19 +1,19 @@
-
-
-from skrl.agents.torch.sac import SAC_RNN as SAC
-from skrl.envs.wrappers.torch import wrap_env
-from skrl.memories.torch import RandomMemory
-from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
-from skrl.agents.torch.sac import SAC_DEFAULT_CONFIG
-
-import gymnasium as gym
+# evaluate_skrl_agent.py
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # quick fix for the OMP crash
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"    # optional: quiet/simplify TF kernels
 
 import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+import gymnasium as gym
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# import the skrl components to build the RL system
+from rail_env import TrainSpeedControl2
 from skrl.agents.torch.sac import SAC_DEFAULT_CONFIG
 from skrl.agents.torch.sac import SAC_RNN as SAC
 from skrl.envs.wrappers.torch import wrap_env
@@ -21,9 +21,9 @@ from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
+from rail_env import TrainSpeedControl2
 
-
-
+# ===== 重要：用你训练时的 Actor / Critic 实现 =====
 class Actor(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
                  clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum",
@@ -166,68 +166,144 @@ class Critic(DeterministicMixin, Model):
         x = F.relu(self.linear_layer_2(x))
 
         return self.linear_layer_3(x), {"rnn": [rnn_states[0], rnn_states[1]]}
-# --- 1️⃣ 构建环境 (必须和训练时一模一样)
-class NoVelocityWrapper(gym.ObservationWrapper):
-    def observation(self, observation):
-        obs = observation.copy().astype(np.float32)
-        obs[2] = 0.0  # mask velocity
-        return obs
 
-gym.register(id="PendulumNoVel-v1",
-             entry_point=lambda: NoVelocityWrapper(gym.make("Pendulum-v1")))
+def build_agent(env, device, checkpoint_path):
+    """构建 SAC_RNN agent 并加载 checkpoint"""
+    # 和训练时完全一致的 5 个模型
+    models = {
+        "policy":          Actor(env.observation_space, env.action_space, device, clip_actions=True, num_envs=env.num_envs),
+        "critic_1":        Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+        "critic_2":        Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+        "target_critic_1": Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+        "target_critic_2": Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
+    }
 
-env = wrap_env(gym.make("PendulumNoVel-v1"))
-device = env.device
+    cfg = SAC_DEFAULT_CONFIG.copy()   # 评估不依赖这些训练超参，但需要一个 cfg
+    agent = SAC(models=models,
+                memory=None,  # 评估不需要 replay
+                cfg=cfg,
+                observation_space=env.observation_space,
+                action_space=env.action_space,
+                device=device)
 
-# --- 2️⃣ 重新定义 Actor / Critic (结构需与训练时完全相同)
-# （这里省略重复定义，你可以直接复制训练脚本里那两段 Actor/Critic 类）
-# class Actor(...) ...
-# class Critic(...) ...
+    # 加载训练得到的权重（路径替换成你的）
+    agent.load(checkpoint_path)
+    agent.init()
+    # 评估模式：确定性动作（高斯取均值），且不更新参数
+    agent.set_running_mode("eval")
+    # 同时把底层 torch 模型也设成 eval（BN/Dropout 等关闭；你这套一般没用到）
+    for m in models.values():
+        m.eval()
+    return agent
 
-# --- 3️⃣ 创建模型和 agent（不需要 memory）
-models = {
-    "policy":          Actor(env.observation_space, env.action_space, device, clip_actions=True, num_envs=env.num_envs),
-    "critic_1":        Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
-    "critic_2":        Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
-    "target_critic_1": Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs),
-    "target_critic_2": Critic(env.observation_space, env.action_space, device, num_envs=env.num_envs)
-}
+def evaluate_once(env, agent, seed=None, render=False):
+    """评估单个 episode；返回日志 dict（和你的原始代码字段对齐）"""
+    if render:
+        try:
+            env.unwrapped.render_mode = "human"
+        except Exception:
+            pass
 
-cfg = SAC_DEFAULT_CONFIG.copy()
-agent = SAC(models=models,
-            memory=None,
-            cfg=cfg,
-            observation_space=env.observation_space,
-            action_space=env.action_space,
-            device=device)
-
-# --- 4️⃣ 加载 checkpoint
-agent.load("runs/torch/PendulumNoVel/checkpoints/best_agent.pt")
-print("✅ Agent checkpoint loaded successfully!")
-
-# 重新创建一个带渲染的环境
-env_render = gym.make("PendulumNoVel-v1", render_mode="human")
-env_render = wrap_env(env_render)
-
-agent.set_running_mode("eval")  # 评估模式（确定性动作）
-
-with torch.no_grad():
-    state, _ = env_render.reset()
+    # Gymnasium reset: (obs, info)
+    state, _ = env.reset()
     done = False
-    total_reward = 0
     t = 0
-    while not done:
-        # 得到动作
-        action = agent.act(torch.as_tensor(state, device=device).unsqueeze(0),
-                           timestep=t, timesteps=0)
-        # 环境推进
-        next_state, reward, terminated, truncated, _ = env_render.step(action.cpu().numpy())
-        done = bool(terminated[0] or truncated[0])
-        total_reward += float(reward[0])
-        state = next_state
-        t += 1
-        env_render.render()  # 打开渲染窗口
-    print("Episode reward:", total_reward)
 
-env_render.close()
+    positions, velocities, accelerations, jerks = [], [], [], []
+    times, powers, rewards, actions, energy = [], [], [], [], []
+    total_reward = 0.0
+    start = datetime.now()
 
+    with torch.no_grad():
+        while not done:
+            # agent.act 期望 torch.Tensor（形状 [num_envs, obs_dim]）
+            state_t = torch.as_tensor(state, device=env.device).unsqueeze(0)
+            # 产生动作（确定性；如需随机评估可改 agent.set_running_mode("explore")）
+            action_t, _, _ = agent.act(state_t, timestep=t, timesteps=0)
+            # action = action_t.cpu().numpy()           # -> (num_envs, act_dim)
+            # action = action_t
+            # print(action)
+            # 环境 step：skrl 的 wrap_env 统一成批维，返回 shape 也带批维
+            next_state, reward, terminated, truncated, info = env.step(action_t)
+
+            done = bool(terminated[0] or truncated[0])
+            total_reward += float(reward[0])
+
+            # 你环境在 info 里塞了各类物理量，这里按你的键取
+            positions.append(info['position'])
+            velocities.append(info['velocity'])
+            accelerations.append(info['acceleration'])
+            jerks.append(info['jerk'])
+            times.append(info['time'])
+            powers.append(info['power'])
+            rewards.append(info['reward'])
+            actions.append(info['action'])
+            energy.append(info['energy'])
+
+            state = next_state
+            t += 1
+
+    elapsed = (datetime.now() - start).total_seconds()
+    print(f"Episode return: {total_reward:.3f} | time: {elapsed:.3f}s | final energy: {energy[-1]}")
+
+    log = {
+        "time": times, "position": positions, "velocity": velocities,
+        "acceleration": accelerations, "jerk": jerks, "power": powers,
+        "energy": energy, "reward": rewards, "action": actions,
+        "episode_return": total_reward, "elapsed_sec": elapsed
+    }
+    return log
+
+def plot_curves(log):
+    # 你的原图保持
+    plt.figure(0, figsize=(8,6))
+    plt.plot(log["position"], log["velocity"], label='Velocity-Position plot')
+    plt.xlabel('Position [m]'); plt.ylabel('Velocity [m/s]'); plt.title('Velocity vs Position'); plt.legend(); plt.grid(True)
+
+    plt.figure(1)
+    plt.plot(log["time"], log["velocity"], label='Velocity-Time plot')
+    plt.xlabel('Time'); plt.ylabel('Velocity'); plt.title('Velocity-Time plot'); plt.legend(); plt.grid(True)
+
+    plt.figure(2)
+    plt.plot(log["time"], log["action"], label='Action-Time plot')
+    plt.xlabel('Time'); plt.ylabel('Action'); plt.title('Action-Time plot'); plt.legend(); plt.grid(True)
+
+    plt.figure(3)
+    plt.plot(log["time"][:min(138, len(log["time"]))], log["reward"][:min(138, len(log["reward"]))], label='Rewards-Time plot')
+    plt.xlabel('Time'); plt.ylabel('Rewards'); plt.title('Rewards-Time plot'); plt.legend(); plt.grid(True)
+
+    plt.show()
+
+def save_csv(log, out_name="skrl_eval_log.csv"):
+    df = pd.DataFrame({
+        "time": log["time"],
+        "position": log["position"],
+        "velocity": log["velocity"],
+        "acceleration": log["acceleration"],
+        "jerk": log["jerk"],
+        "power": log["power"],
+        "energy": log["energy"],
+        "reward": log["reward"],
+        "action": log["action"],
+    })
+    df.to_csv(out_name, index=False)
+    print(f"Saved ➜ {out_name}  ({len(df)} rows)")
+
+if __name__ == "__main__":
+    # 1) 实例化你的环境（保持与训练一致）
+    env = wrap_env(TrainSpeedControl2())
+    device = env.device
+    print("Device:", device)
+    print("Obs space:", env.observation_space, "Act space:", env.action_space)
+
+    # 2) 构建 agent 并加载 checkpoint（把路径换成你的 skrl 训练保存目录）
+    checkpoint = r"C:\Users\lyumi\Documents\GitHub\RailRecurrentSAC1.0\runs\torch\PendulumNoVel\25-10-04_16-25-50-522269_SAC_RNN\checkpoints\best_agent.pt"
+    agent = build_agent(env, device, checkpoint)
+
+    # 3) 评估一回合（也可以写个循环评多个）
+    log = evaluate_once(env, agent, seed=0, render=False)
+    print(log)
+    # 4) 可视化 & 保存
+    plot_curves(log)
+    print("plot over")
+    save_csv(log, out_name="skrl_eval_log.csv")

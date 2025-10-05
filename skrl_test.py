@@ -211,7 +211,7 @@ cfg["learn_entropy"] = True
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg["experiment"]["write_interval"] = 75
 cfg["experiment"]["checkpoint_interval"] = 750
-cfg["experiment"]["directory"] = "runs/torch/PendulumNoVel"
+cfg["experiment"]["directory"] = "runs/torch/LSTMSAC_TrainSpeedControl2/"
 
 agent = SAC(models=models,
             memory=memory,
