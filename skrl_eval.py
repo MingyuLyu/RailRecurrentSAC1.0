@@ -27,7 +27,7 @@ from rail_env import TrainSpeedControl2
 class Actor(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
                  clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum",
-                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=20):
+                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=128):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
 
@@ -47,6 +47,8 @@ class Actor(GaussianMixin, Model):
 
         self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
 
+        self._dbg_times = 0
+
     def get_specification(self):
         # batch size (N) is the number of envs
         return {"rnn": {"sequence_length": self.sequence_length,
@@ -54,9 +56,46 @@ class Actor(GaussianMixin, Model):
                                   (self.num_layers, self.num_envs, self.hidden_size)]}}  # cell states   (D ∗ num_layers, N, Hcell)
 
     def compute(self, inputs, role):
+        # states = inputs["states"]
+        # terminated = inputs.get("terminated", None)
+        # hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
+
         states = inputs["states"]
         terminated = inputs.get("terminated", None)
-        hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
+
+        # ---- RNN 状态健壮获取 + 调试打印（只打前 5 次，避免刷屏）----
+        rnn_in = inputs.get("rnn", None)
+
+        if not hasattr(self, "_dbg_times"):
+            self._dbg_times = 0
+        dbg = self._dbg_times < 5
+
+        if dbg:
+            print(f"[DBG][{self.__class__.__name__}] training={self.training} role={role} "
+                  f"states.shape={tuple(states.shape)} "
+                  f"has_rnn={(isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2)} "
+                  f"keys={list(inputs.keys())}")
+
+        if isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2:
+            hidden_states, cell_states = rnn_in[0], rnn_in[1]
+        else:
+            # 没传 rnn：按当前批次维度零初始化（不会崩，并能看到 has_rnn=False）
+            if self.training:
+                assert states.dim() == 2, "expect (N*L, obs_dim) during training"
+                N = states.shape[0] // self.sequence_length
+                size = (self.num_layers, N * self.sequence_length, self.hidden_size)
+            else:
+                N = states.shape[0]  # rollout: (num_envs, obs_dim)
+                size = (self.num_layers, N, self.hidden_size)
+
+            hidden_states = torch.zeros(size, device=states.device, dtype=states.dtype)
+            cell_states = torch.zeros(size, device=states.device, dtype=states.dtype)
+
+        if dbg:
+            print(f"[DBG][{self.__class__.__name__}] h.shape={tuple(hidden_states.shape)} "
+                  f"c.shape={tuple(cell_states.shape)}")
+            self._dbg_times += 1
+        # ---------------------------------------------------------
 
         # training
         if self.training:
@@ -98,10 +137,18 @@ class Actor(GaussianMixin, Model):
 
         # Pendulum-v1 action_space is -2 to 2
         return 2 * torch.tanh(self.action_layer(x)), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
+        # 通用动作缩放：tanh 输出 ∈ [-1, 1] → 线性映射到 [low, high]
+        # raw = torch.tanh(self.action_layer(x))  # (N*L, num_actions)
+        #
+        # act_low = torch.as_tensor(self.action_space.low, device=raw.device, dtype=raw.dtype)
+        # act_high = torch.as_tensor(self.action_space.high, device=raw.device, dtype=raw.dtype)
+        #
+        # mean = (act_high + act_low) / 2 + raw * (act_high - act_low) / 2
+        # return mean, self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
 
 class Critic(DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
-                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=20):
+                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=128):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions)
 
@@ -119,6 +166,8 @@ class Critic(DeterministicMixin, Model):
         self.linear_layer_2 = nn.Linear(400, 300)
         self.linear_layer_3 = nn.Linear(300, 1)
 
+        self._dbg_times = 0
+
     def get_specification(self):
         # batch size (N) is the number of envs
         return {"rnn": {"sequence_length": self.sequence_length,
@@ -126,9 +175,46 @@ class Critic(DeterministicMixin, Model):
                                   (self.num_layers, self.num_envs, self.hidden_size)]}}  # cell states   (D ∗ num_layers, N, Hcell)
 
     def compute(self, inputs, role):
+        # states = inputs["states"]
+        # terminated = inputs.get("terminated", None)
+        # hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
+
         states = inputs["states"]
         terminated = inputs.get("terminated", None)
-        hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
+
+        # ---- RNN 状态健壮获取 + 调试打印（只打前 5 次，避免刷屏）----
+        rnn_in = inputs.get("rnn", None)
+
+        if not hasattr(self, "_dbg_times"):
+            self._dbg_times = 0
+        dbg = self._dbg_times < 5
+
+        if dbg:
+            print(f"[DBG][{self.__class__.__name__}] training={self.training} role={role} "
+                  f"states.shape={tuple(states.shape)} "
+                  f"has_rnn={(isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2)} "
+                  f"keys={list(inputs.keys())}")
+
+        if isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2:
+            hidden_states, cell_states = rnn_in[0], rnn_in[1]
+        else:
+            # 没传 rnn：按当前批次维度零初始化（不会崩，并能看到 has_rnn=False）
+            if self.training:
+                assert states.dim() == 2, "expect (N*L, obs_dim) during training"
+                N = states.shape[0] // self.sequence_length
+                size = (self.num_layers, N * self.sequence_length, self.hidden_size)
+            else:
+                N = states.shape[0]  # rollout: (num_envs, obs_dim)
+                size = (self.num_layers, N, self.hidden_size)
+
+            hidden_states = torch.zeros(size, device=states.device, dtype=states.dtype)
+            cell_states = torch.zeros(size, device=states.device, dtype=states.dtype)
+
+        if dbg:
+            print(f"[DBG][{self.__class__.__name__}] h.shape={tuple(hidden_states.shape)} "
+                  f"c.shape={tuple(cell_states.shape)}")
+            self._dbg_times += 1
+        # ---------------------------------------------------------
 
         # critic is only used during training
         rnn_input = states.view(-1, self.sequence_length, states.shape[-1])  # (N, L, Hin): N=batch_size, L=sequence_length
@@ -210,7 +296,7 @@ def evaluate_once(env, agent, seed=None, render=False):
     t = 0
 
     positions, velocities, accelerations, jerks = [], [], [], []
-    times, powers, rewards, actions, energy = [], [], [], [], []
+    times, powers, rewards, actions_safe, actions_raw, energy = [], [], [], [], [], []
     total_reward = 0.0
     start = datetime.now()
 
@@ -237,7 +323,8 @@ def evaluate_once(env, agent, seed=None, render=False):
             times.append(info['time'])
             powers.append(info['power'])
             rewards.append(info['reward'])
-            actions.append(info['action'])
+            actions_safe.append(info['action_safe'])
+            actions_raw.append(info['action_raw'])
             energy.append(info['energy'])
 
             state = next_state
@@ -249,7 +336,7 @@ def evaluate_once(env, agent, seed=None, render=False):
     log = {
         "time": times, "position": positions, "velocity": velocities,
         "acceleration": accelerations, "jerk": jerks, "power": powers,
-        "energy": energy, "reward": rewards, "action": actions,
+        "energy": energy, "reward": rewards, "action_safe": actions_safe, "action_raw": actions_raw,
         "episode_return": total_reward, "elapsed_sec": elapsed
     }
     return log
@@ -265,12 +352,16 @@ def plot_curves(log):
     plt.xlabel('Time'); plt.ylabel('Velocity'); plt.title('Velocity-Time plot'); plt.legend(); plt.grid(True)
 
     plt.figure(2)
-    plt.plot(log["time"], log["action"], label='Action-Time plot')
+    plt.plot(log["time"], log["action_safe"], label='Action_safe-Time plot')
     plt.xlabel('Time'); plt.ylabel('Action'); plt.title('Action-Time plot'); plt.legend(); plt.grid(True)
 
     plt.figure(3)
     plt.plot(log["time"][:min(138, len(log["time"]))], log["reward"][:min(138, len(log["reward"]))], label='Rewards-Time plot')
     plt.xlabel('Time'); plt.ylabel('Rewards'); plt.title('Rewards-Time plot'); plt.legend(); plt.grid(True)
+
+    plt.figure(4)
+    plt.plot(log["time"], log["action_raw"], label='Action_raw-Time plot')
+    plt.xlabel('Time'); plt.ylabel('Action'); plt.title('Action-Time plot'); plt.legend(); plt.grid(True)
 
     plt.show()
 
@@ -284,7 +375,8 @@ def save_csv(log, out_name="skrl_eval_log.csv"):
         "power": log["power"],
         "energy": log["energy"],
         "reward": log["reward"],
-        "action": log["action"],
+        "action_safe": log["action_safe"],
+        "action_raw": log["action_raw"],
     })
     df.to_csv(out_name, index=False)
     print(f"Saved ➜ {out_name}  ({len(df)} rows)")
@@ -297,13 +389,13 @@ if __name__ == "__main__":
     print("Obs space:", env.observation_space, "Act space:", env.action_space)
 
     # 2) 构建 agent 并加载 checkpoint（把路径换成你的 skrl 训练保存目录）
-    checkpoint = r"C:\Users\lyumi\Documents\GitHub\RailRecurrentSAC1.0\runs\torch\PendulumNoVel\25-10-04_16-25-50-522269_SAC_RNN\checkpoints\best_agent.pt"
+    checkpoint = r"C:\Users\root\Documents\GitHub\RailRecurrentSAC1.0\runs\torch\LSTMSAC_TrainSpeedControl2\25-10-10_21-23-05-356690_SAC_RNN\checkpoints\agent_200000.pt"
     agent = build_agent(env, device, checkpoint)
 
     # 3) 评估一回合（也可以写个循环评多个）
     log = evaluate_once(env, agent, seed=0, render=False)
-    print(log)
+    # print(log)
     # 4) 可视化 & 保存
     plot_curves(log)
-    print("plot over")
+    # print("plot over")
     save_csv(log, out_name="skrl_eval_log.csv")

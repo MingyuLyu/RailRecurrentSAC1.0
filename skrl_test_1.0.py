@@ -15,6 +15,7 @@ from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 from rail_env import TrainSpeedControl2
 
+
 # seed for reproducibility
 set_seed()  # e.g. `set_seed(42)` for fixed seed
 
@@ -23,7 +24,7 @@ set_seed()  # e.g. `set_seed(42)` for fixed seed
 class Actor(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
                  clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum",
-                 num_envs=1, num_layers=2, hidden_size=512, sequence_length=32):
+                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=128):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
 
@@ -43,8 +44,6 @@ class Actor(GaussianMixin, Model):
 
         self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
 
-        self._dbg_times = 0
-
     def get_specification(self):
         # batch size (N) is the number of envs
         return {"rnn": {"sequence_length": self.sequence_length,
@@ -52,46 +51,9 @@ class Actor(GaussianMixin, Model):
                                   (self.num_layers, self.num_envs, self.hidden_size)]}}  # cell states   (D ∗ num_layers, N, Hcell)
 
     def compute(self, inputs, role):
-        # states = inputs["states"]
-        # terminated = inputs.get("terminated", None)
-        # hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
-
         states = inputs["states"]
         terminated = inputs.get("terminated", None)
-
-        # ---- RNN 状态健壮获取 + 调试打印（只打前 5 次，避免刷屏）----
-        rnn_in = inputs.get("rnn", None)
-
-        if not hasattr(self, "_dbg_times"):
-            self._dbg_times = 0
-        dbg = self._dbg_times < 5
-
-        if dbg:
-            print(f"[DBG][{self.__class__.__name__}] training={self.training} role={role} "
-                  f"states.shape={tuple(states.shape)} "
-                  f"has_rnn={(isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2)} "
-                  f"keys={list(inputs.keys())}")
-
-        if isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2:
-            hidden_states, cell_states = rnn_in[0], rnn_in[1]
-        else:
-            # 没传 rnn：按当前批次维度零初始化（不会崩，并能看到 has_rnn=False）
-            if self.training:
-                assert states.dim() == 2, "expect (N*L, obs_dim) during training"
-                N = states.shape[0] // self.sequence_length
-                size = (self.num_layers, N * self.sequence_length, self.hidden_size)
-            else:
-                N = states.shape[0]  # rollout: (num_envs, obs_dim)
-                size = (self.num_layers, N, self.hidden_size)
-
-            hidden_states = torch.zeros(size, device=states.device, dtype=states.dtype)
-            cell_states = torch.zeros(size, device=states.device, dtype=states.dtype)
-
-        if dbg:
-            print(f"[DBG][{self.__class__.__name__}] h.shape={tuple(hidden_states.shape)} "
-                  f"c.shape={tuple(cell_states.shape)}")
-            self._dbg_times += 1
-        # ---------------------------------------------------------
+        hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
 
         # training
         if self.training:
@@ -132,19 +94,12 @@ class Actor(GaussianMixin, Model):
         x = F.relu(self.linear_layer_2(x))
 
         # Pendulum-v1 action_space is -2 to 2
-        return 2 * torch.tanh(self.action_layer(x)), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
-        # 通用动作缩放：tanh 输出 ∈ [-1, 1] → 线性映射到 [low, high]
-        # raw = torch.tanh(self.action_layer(x))  # (N*L, num_actions)
-        #
-        # act_low = torch.as_tensor(self.action_space.low, device=raw.device, dtype=raw.dtype)
-        # act_high = torch.as_tensor(self.action_space.high, device=raw.device, dtype=raw.dtype)
-        #
-        # mean = (act_high + act_low) / 2 + raw * (act_high - act_low) / 2
-        # return mean, self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
+        # return 2 * torch.tanh(self.action_layer(x)), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
+        return self.action_layer(x), self.log_std_parameter, {"rnn": [rnn_states[0], rnn_states[1]]}
 
 class Critic(DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
-                 num_envs=1, num_layers=2, hidden_size=512, sequence_length=32):
+                 num_envs=1, num_layers=1, hidden_size=400, sequence_length=128):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions)
 
@@ -162,8 +117,6 @@ class Critic(DeterministicMixin, Model):
         self.linear_layer_2 = nn.Linear(400, 300)
         self.linear_layer_3 = nn.Linear(300, 1)
 
-        self._dbg_times = 0
-
     def get_specification(self):
         # batch size (N) is the number of envs
         return {"rnn": {"sequence_length": self.sequence_length,
@@ -171,46 +124,9 @@ class Critic(DeterministicMixin, Model):
                                   (self.num_layers, self.num_envs, self.hidden_size)]}}  # cell states   (D ∗ num_layers, N, Hcell)
 
     def compute(self, inputs, role):
-        # states = inputs["states"]
-        # terminated = inputs.get("terminated", None)
-        # hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
-
         states = inputs["states"]
         terminated = inputs.get("terminated", None)
-
-        # ---- RNN 状态健壮获取 + 调试打印（只打前 5 次，避免刷屏）----
-        rnn_in = inputs.get("rnn", None)
-
-        if not hasattr(self, "_dbg_times"):
-            self._dbg_times = 0
-        dbg = self._dbg_times < 5
-
-        if dbg:
-            print(f"[DBG][{self.__class__.__name__}] training={self.training} role={role} "
-                  f"states.shape={tuple(states.shape)} "
-                  f"has_rnn={(isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2)} "
-                  f"keys={list(inputs.keys())}")
-
-        if isinstance(rnn_in, (list, tuple)) and len(rnn_in) == 2:
-            hidden_states, cell_states = rnn_in[0], rnn_in[1]
-        else:
-            # 没传 rnn：按当前批次维度零初始化（不会崩，并能看到 has_rnn=False）
-            if self.training:
-                assert states.dim() == 2, "expect (N*L, obs_dim) during training"
-                N = states.shape[0] // self.sequence_length
-                size = (self.num_layers, N * self.sequence_length, self.hidden_size)
-            else:
-                N = states.shape[0]  # rollout: (num_envs, obs_dim)
-                size = (self.num_layers, N, self.hidden_size)
-
-            hidden_states = torch.zeros(size, device=states.device, dtype=states.dtype)
-            cell_states = torch.zeros(size, device=states.device, dtype=states.dtype)
-
-        if dbg:
-            print(f"[DBG][{self.__class__.__name__}] h.shape={tuple(hidden_states.shape)} "
-                  f"c.shape={tuple(cell_states.shape)}")
-            self._dbg_times += 1
-        # ---------------------------------------------------------
+        hidden_states, cell_states = inputs["rnn"][0], inputs["rnn"][1]
 
         # critic is only used during training
         rnn_input = states.view(-1, self.sequence_length, states.shape[-1])  # (N, L, Hin): N=batch_size, L=sequence_length
@@ -257,11 +173,8 @@ class NoVelocityWrapper(gym.ObservationWrapper):
         return observation * np.array([1, 1, 0])
 
 # gym.register(id="PendulumNoVel-v1", entry_point=lambda: NoVelocityWrapper(gym.make("Pendulum-v1")))
-#
-# # load and wrap the gymnasium environment
-# env = gym.make("PendulumNoVel-v1")
-# env = wrap_env(env)
 
+# load and wrap the gymnasium environment
 env = TrainSpeedControl2()
 env = wrap_env(env)
 device = env.device
@@ -289,22 +202,15 @@ for model in models.values():
 # configure and instantiate the agent (visit its documentation to see all the options)
 # https://skrl.readthedocs.io/en/latest/api/agents/sac.html#configuration-and-hyperparameters
 cfg = SAC_DEFAULT_CONFIG.copy()
-cfg["discount_factor"] = 0.98
-cfg["batch_size"] = 16
-cfg["random_timesteps"] = 2048
-cfg["learning_starts"] = 2048
+cfg["discount_factor"] = 0.99
+cfg["batch_size"] = 512
+cfg["random_timesteps"] = 0
+cfg["learning_starts"] = 65536
 cfg["learn_entropy"] = True
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg["experiment"]["write_interval"] = 1000
 cfg["experiment"]["checkpoint_interval"] = 25000
 cfg["experiment"]["directory"] = "runs/torch/LSTMSAC_TrainSpeedControl2/"
-
-
-print("—— RNN spec (policy) ——")
-print(models["policy"].get_specification().get("rnn", None))
-print("—— RNN spec (critic_1) ——")
-print(models["critic_1"].get_specification().get("rnn", None))
-
 
 agent = SAC(models=models,
             memory=memory,
@@ -315,7 +221,7 @@ agent = SAC(models=models,
 
 
 # configure and instantiate the RL trainer
-cfg_trainer = {"timesteps": 50000, "headless": True}
+cfg_trainer = {"timesteps": 1000000, "headless": True}
 trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=[agent])
 
 # start training
