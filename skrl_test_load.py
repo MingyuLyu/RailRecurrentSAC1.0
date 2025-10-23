@@ -151,8 +151,8 @@ NUM_ENVS = 16
 
 def make_env():
     def _init():
-        # return TrainSpeedControl2()
-        return BehaviorCloning()
+        return TrainSpeedControl2()
+        # return BehaviorCloning()
     return _init
 
 # 选项 A：更稳（建议先用）
@@ -197,7 +197,7 @@ cfg["discount_factor"]   = 0.99
 cfg["tau"]               = 0.01
 cfg["batch_size"]        = 256
 cfg["random_timesteps"]  = 0   # ← 必须：探索热身
-cfg["learning_starts"]   = 2000
+cfg["learning_starts"]   = 5000
 cfg["grad_norm_clip"]    = 1.0
 
 # 熵温度：**推荐自动**
@@ -221,6 +221,13 @@ agent = SAC(models=models, memory=memory, cfg=cfg,
 # ---------------------------
 # 训练
 # ---------------------------
-cfg_trainer = {"timesteps": 100_000, "headless": True}
+checkpoint = r"C:\Users\root\Documents\GitHub\RailRecurrentSAC1.0\runs\torch\LSTMSAC_TrainSpeedControl2_parallel\25-10-21_12-25-41-169023_SAC_RNN\checkpoints\policy_10000.pt"
+agent.load(checkpoint)
+
+
+# configure and instantiate the RL trainer
+cfg_trainer = {"timesteps": 1000000, "headless": True}
 trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=[agent])
+
+# start training
 trainer.train()
